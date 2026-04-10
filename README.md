@@ -4,7 +4,8 @@ This repository provides a comprehensive evaluation suite for **RFDet (Specifica
 
 ## 🚀 Features
 
-- **Full COCO Evaluation**: Calculates mAP@50:95, mAP@50, mAP@75, and mAR@100 for segmentation.
+- **Full COCO Evaluation**: Calculates mAP@50:95, mAP@50, mAP@75, and mAR@100 for both segmentation and bounding boxes.
+- **Dedicated Object Detection Suite**: Separately evaluate bounding box performance (`evaluate_rfdet_object_detection.py`).
 - **Detailed Classification Report**: Provides Precision, Recall, and F1-score per class at configurable IoU and confidence thresholds.
 - **Confusion Matrix**: Visualizes True Positives (TP), False Positives (FP), and False Negatives (FN) including background transitions.
 - **Per-Class Visualizations**: Generates bar charts for Precision, Recall, and F1-score for each category.
@@ -22,7 +23,8 @@ pip install torch supervision tqdm pillow numpy matplotlib seaborn pycocotools
 
 ## 📂 Project Structure
 
-- `evealte_rfdet_instance_segmntation.py`: The main evaluation script.
+- `evealte_rfdet_instance_segmntation.py`: The main evaluation script for instance segmentation models.
+- `evaluate_rfdet_object_detection.py`: A dedicated script for evaluating bounding box (object detection) performance.
 - `checkpoint_best_total.pth`: (Not included) Your trained model weights.
 - `dataset/`: Your COCO formatted dataset (images and `_annotations.coco.json`).
 
