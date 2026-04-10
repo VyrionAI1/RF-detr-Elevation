@@ -109,7 +109,39 @@ CONF_THRESHOLD = 0.5   # tune: 0.3 / 0.5 / 0.7
 coco_results_filtered = [r for r in coco_results if r["score"] >= CONF_THRESHOLD]
 print(f"  Before filter : {len(coco_results):,}")
 print(f"  After  filter : {len(coco_results_filtered):,}")
+# ============================================================
+# Fix: keep only category_id == 1 (your actual lesion class)
+# ============================================================
 
+# 1. Check what's in your annotation file
+print("Categories in annotation file:")
+print(coco_gt.dataset["categories"])
+
+# 2. Define which category IDs are real (adjust if needed)
+VALID_CAT_IDS = {1}   # ← set this to your actual class id(s)
+
+# 3. Filter ground truth annotations
+coco_gt.dataset["annotations"] = [
+    ann for ann in coco_gt.dataset["annotations"]
+    if ann["category_id"] in VALID_CAT_IDS
+]
+# Also filter the categories list itself
+coco_gt.dataset["categories"] = [
+    cat for cat in coco_gt.dataset["categories"]
+    if cat["id"] in VALID_CAT_IDS
+]
+# Rebuild internal index
+coco_gt.createIndex()
+
+# 4. Filter predictions too
+coco_results_filtered = [
+    r for r in coco_results_filtered
+    if r["category_id"] in VALID_CAT_IDS
+]
+
+print("\nAfter fix:")
+print("Categories:", coco_gt.dataset["categories"])
+print(f"Filtered predictions: {len(coco_results_filtered)}")
 # ============================================================
 # 6- Evaluate with pycocotools
 # ============================================================
