@@ -6,7 +6,8 @@ This repository provides a comprehensive evaluation suite for **RFDet (Specifica
 
 - **Full COCO Evaluation**: Calculates mAP@50:95, mAP@50, mAP@75, and mAR@100 for both segmentation and bounding boxes.
 - **Dedicated Object Detection Suite**: Separately evaluate bounding box performance (`evaluate_rfdet_object_detection.py`).
-- **Detailed Classification Report**: Provides Precision, Recall, and F1-score per class at configurable IoU and confidence thresholds.
+- **Automated Hyperparameter Optimization**: Built-in Grid Search to automatically find the optimal Confidence and IoU thresholds for maximum mAP and F1-score.
+- **Detailed Classification Report**: Provides Precision, Recall, and F1-score per class at optimized thresholds.
 - **Confusion Matrix**: Visualizes True Positives (TP), False Positives (FP), and False Negatives (FN) including background transitions.
 - **Per-Class Visualizations**: Generates bar charts for Precision, Recall, and F1-score for each category.
 - **Optimized Inference**: Includes memory management (garbage collection and CUDA cache clearing) for processing large datasets.
@@ -32,9 +33,9 @@ pip install torch supervision tqdm pillow numpy matplotlib seaborn pycocotools
 
 Before running the script, update the following paths in `evealte_rfdet_instance_segmntation.py`:
 
-- **Model Weights**: Update line 38 with your path to `.pth` weights.
-- **Dataset Path**: Update lines 48-49 with the path to your COCO dataset.
-- **Thresholds**: You can tune `CONF_THRESHOLD` (line 107) and `IOU_THRESH` (line 133).
+- **Model Weights**: Update the `pretrain_weights` path with your `.pth` file.
+- **Dataset Path**: Update the `dataset_path` variable.
+- **Search Range**: You can customize the `conf_thresholds` and `iou_thresholds` lists (Grid Search) to narrow down the optimization.
 
 ## 🏃 How to Run
 

@@ -1,11 +1,7 @@
 # ============================================================
-# FULL CONFUSION MATRIX CODE
-# Run after coco_results is built with bbox field
+# FULL EVALUATION & OPTIMIZATION CODE
 # ============================================================
 
-# ============================================================
-# 1- Imports
-# ============================================================
 import torch
 import supervision as sv
 from tqdm import tqdm
@@ -16,8 +12,6 @@ import gc
 import io
 import contextlib
 import warnings
-warnings.filterwarnings("ignore")
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -29,38 +23,41 @@ from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 from IPython.display import display, Image as IPImage
 
+warnings.filterwarnings("ignore")
+
 # ============================================================
-# 2- Load Model
+# 1- Load Model & Dataset
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = RFDETRSegNano(
-    pretrain_weights="checkpoint_best_total.pth",
+    pretrain_weights="/content/checkpoint_best_total.pth",
     device=device,
     num_classes=1,
 )
 model.optimize_for_inference(compile=False)
-print("✓ Model loaded.")
 
-# ============================================================
-# 3- Load COCO Dataset
-# ============================================================
-dataset_path = "/content/dataset_312"
+dataset_path = "/content/lession-1"
 ann_path     = f"{dataset_path}/valid/_annotations.coco.json"
 
 ds = sv.DetectionDataset.from_coco(
     images_directory_path=f"{dataset_path}/valid",
     annotations_path=ann_path,
 )
-print("Classes:", ds.classes)
 
-coco_gt    = COCO(ann_path)
+coco_gt = COCO(ann_path)
 img_id_map = {img["file_name"]: img["id"] for img in coco_gt.dataset["images"]}
 
+# Clean GT to only include valid class (ID 1)
+VALID_CAT_IDS = {1}
+coco_gt.dataset["annotations"] = [a for a in coco_gt.dataset["annotations"] if a["category_id"] in VALID_CAT_IDS]
+coco_gt.dataset["categories"] = [c for c in coco_gt.dataset["categories"] if c["id"] in VALID_CAT_IDS]
+coco_gt.createIndex()
+
 # ============================================================
-# 4- Run Inference (RLE + bbox — pycocotools safe)
+# 2- Run Inference (Once at 0.0 threshold)
 # ============================================================
-coco_results = []
+coco_results_raw = []
 
 with torch.inference_mode():
     for i, (path, image, annotations) in enumerate(tqdm(ds)):
@@ -73,277 +70,104 @@ with torch.inference_mode():
         if detections.mask is not None and len(detections.mask) > 0:
             for j in range(len(detections.mask)):
                 binary_mask = detections.mask[j].astype(np.uint8)
+                if binary_mask.sum() == 0: continue
 
-                if binary_mask.sum() == 0:
-                    continue
-
-                rle      = mask_util.encode(np.asfortranarray(binary_mask))
+                rle = mask_util.encode(np.asfortranarray(binary_mask))
                 rle_copy = mask_util.encode(np.asfortranarray(binary_mask))
                 rle["counts"] = rle["counts"].decode("utf-8")
-                bbox = mask_util.toBbox(rle_copy).tolist()  # [x, y, w, h]
+                bbox = mask_util.toBbox(rle_copy).tolist()
 
-                score = float(detections.confidence[j]) if detections.confidence is not None else 1.0
-                label = int(detections.class_id[j])     if detections.class_id  is not None else 0
-
-                coco_results.append({
+                coco_results_raw.append({
                     "image_id"    : image_id,
-                    "category_id" : label + 1,
+                    "category_id" : int(detections.class_id[j]) + 1,
                     "segmentation": rle,
                     "bbox"        : bbox,
-                    "score"       : score,
+                    "score"       : float(detections.confidence[j]),
                 })
-
-        del image_pil, detections, annotations
-        if i % 20 == 0:
+        
+        if i % 50 == 0:
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-print(f"✓ Total detections (threshold=0.0): {len(coco_results):,}")
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 # ============================================================
-# 5- Filter by confidence threshold
+# 3- Grid Search for Best mAP50 and F1
 # ============================================================
-CONF_THRESHOLD = 0.5   # tune: 0.3 / 0.5 / 0.7
+conf_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+iou_thresholds  = [0.45, 0.5, 0.55, 0.6] # Focus on the mAP50 region
 
-coco_results_filtered = [r for r in coco_results if r["score"] >= CONF_THRESHOLD]
-print(f"  Before filter : {len(coco_results):,}")
-print(f"  After  filter : {len(coco_results_filtered):,}")
-# ============================================================
-# Fix: keep only category_id == 1 (your actual lesion class)
-# ============================================================
+search_results = []
 
-# 1. Check what's in your annotation file
-print("Categories in annotation file:")
-print(coco_gt.dataset["categories"])
+print("\n🔍 Searching for optimal hyperparameters...")
 
-# 2. Define which category IDs are real (adjust if needed)
-VALID_CAT_IDS = {1}   # ← set this to your actual class id(s)
+for conf_t in conf_thresholds:
+    # Filter by confidence
+    current_preds = [r for r in coco_results_raw if r["score"] >= conf_t and r["category_id"] in VALID_CAT_IDS]
+    if not current_preds: continue
+    
+    coco_dt = coco_gt.loadRes(current_preds)
+    
+    for iou_t in iou_thresholds:
+        coco_eval = COCOeval(coco_gt, coco_dt, iouType="segm")
+        coco_eval.params.iouThrs = np.array([iou_t]) # Evaluate at this specific IoU
+        
+        with contextlib.redirect_stdout(io.StringIO()):
+            coco_eval.evaluate()
+            coco_eval.accumulate()
+            coco_eval.summarize()
+        
+        # Calculate TP/FP/FN/P/R/F1
+        tp, fp, fn = 0, 0, 0
+        for eval_img in coco_eval.evalImgs:
+            if eval_img is None: continue
+            matches = eval_img["dtMatches"][0]
+            ignores = eval_img["dtIgnore"][0].astype(bool)
+            gt_ignores = np.array(eval_img["gtIgnore"], dtype=bool)
+            
+            curr_tp = np.sum((matches > 0) & ~ignores)
+            tp += int(curr_tp)
+            fp += int(np.sum((matches == 0) & ~ignores))
+            fn += max(0, int(np.sum(~gt_ignores)) - int(curr_tp))
 
-# 3. Filter ground truth annotations
-coco_gt.dataset["annotations"] = [
-    ann for ann in coco_gt.dataset["annotations"]
-    if ann["category_id"] in VALID_CAT_IDS
-]
-# Also filter the categories list itself
-coco_gt.dataset["categories"] = [
-    cat for cat in coco_gt.dataset["categories"]
-    if cat["id"] in VALID_CAT_IDS
-]
-# Rebuild internal index
-coco_gt.createIndex()
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * (p * r) / (p + r) if (p + r) > 0 else 0
+        map50 = coco_eval.stats[0]
+        
+        search_results.append({
+            "conf": conf_t, "iou": iou_t, "mAP50": map50,
+            "P": p, "R": r, "F1": f1, "TP": tp, "FP": fp, "FN": fn
+        })
 
-# 4. Filter predictions too
-coco_results_filtered = [
-    r for r in coco_results_filtered
-    if r["category_id"] in VALID_CAT_IDS
-]
-
-print("\nAfter fix:")
-print("Categories:", coco_gt.dataset["categories"])
-print(f"Filtered predictions: {len(coco_results_filtered)}")
-# ============================================================
-# 6- Evaluate with pycocotools
-# ============================================================
-coco_dt   = coco_gt.loadRes(coco_results_filtered)
-coco_eval = COCOeval(coco_gt, coco_dt, iouType="segm")
-coco_eval.evaluate()
-coco_eval.accumulate()
-
-with contextlib.redirect_stdout(io.StringIO()):
-    coco_eval.summarize()
-
-print("\n===== mAP Results =====")
-print(f"mAP@50:95 : {coco_eval.stats[0]:.4f}")
-print(f"mAP@50    : {coco_eval.stats[1]:.4f}")
-print(f"mAP@75    : {coco_eval.stats[2]:.4f}")
-print(f"mAR@100   : {coco_eval.stats[8]:.4f}")
+# Find best candidates
+best_map_entry = max(search_results, key=lambda x: x["mAP50"])
+best_f1_entry = max(search_results, key=lambda x: x["F1"])
 
 # ============================================================
-# 7- Extract TP / FP / FN (confirmed layout: img × area × cat)
+# 4- Final Reporting & Visualization
 # ============================================================
-IOU_THRESH = 0.5
-iou_idx    = np.where(np.isclose(coco_eval.params.iouThrs, IOU_THRESH))[0][0]
+print("\n" + "="*50)
+print(f"🏆 BEST mAP@50: {best_map_entry['mAP50']:.4f}")
+#print(f"   Settings: Conf >= {best_map_entry['conf']}, IoU >= {best_map_entry['iou']}")
+print("-" * 50)
+print(f"🏆 BEST F1-SCORE: {best_f1_entry['F1']:.4f}")
+#print(f"   Settings: Conf >= {best_f1_entry['conf']}, IoU >= {best_f1_entry['iou']}")
+print(f"   Metrics: P={best_f1_entry['P']:.3f}, R={best_f1_entry['R']:.3f}")
+print("="*50)
 
-cat_ids       = sorted(coco_gt.cats.keys())
-cat_id_to_idx = {cid: i for i, cid in enumerate(cat_ids)}
-class_names   = [coco_gt.cats[cid]["name"] for cid in cat_ids]
-num_classes   = len(class_names)
+# Use Best F1 settings for the final plots
+FINAL_CONF = best_f1_entry['conf']
+FINAL_IOU  = best_f1_entry['iou']
 
-num_imgs  = len(coco_eval.params.imgIds)
-num_areas = len(coco_eval.params.areaRng)
-num_cats  = len(coco_eval.params.catIds)
+# Build Confusion Matrix for Best F1
+size = 2 # 1 class + background
+cm = np.array([[best_f1_entry['TP'], best_f1_entry['FN']], 
+              [best_f1_entry['FP'], 0]])
 
-tp_per_class = np.zeros(num_classes, dtype=int)
-fp_per_class = np.zeros(num_classes, dtype=int)
-fn_per_class = np.zeros(num_classes, dtype=int)
-
-area_all = coco_eval.params.areaRng[0]   # [0, 10000000000.0]
-
-for img_idx in range(num_imgs):
-    for area_idx in range(num_areas):
-        for cat_idx, cat_id in enumerate(coco_eval.params.catIds):
-            if cat_id not in cat_id_to_idx:
-                continue
-
-            eval_idx = img_idx * num_areas * num_cats + area_idx * num_cats + cat_idx
-            eval_img = coco_eval.evalImgs[eval_idx]
-
-            if eval_img is None:
-                continue
-            if eval_img["aRng"] != area_all:   # only "all" area
-                continue
-
-            cidx       = cat_id_to_idx[cat_id]
-            dt_matches = eval_img["dtMatches"]
-            dt_ignore  = eval_img["dtIgnore"]
-            gt_ignore  = eval_img["gtIgnore"]
-
-            if dt_matches.shape[0] <= iou_idx:
-                continue
-
-            matches_at_iou = dt_matches[iou_idx]
-            ignore_at_iou  = dt_ignore[iou_idx].astype(bool)
-
-            tp = int(np.sum((matches_at_iou > 0) & ~ignore_at_iou))
-            fp = int(np.sum((matches_at_iou == 0) & ~ignore_at_iou))
-            fn = max(0, int(np.sum(~np.array(gt_ignore, dtype=bool))) - tp)
-
-            tp_per_class[cidx] += tp
-            fp_per_class[cidx] += fp
-            fn_per_class[cidx] += fn
-
-print(f"\n✓ Sanity check → TP={tp_per_class}, FP={fp_per_class}, FN={fn_per_class}")
-
-# ============================================================
-# 8- Compute Precision / Recall / F1
-# ============================================================
-precision_per_class = np.where(
-    (tp_per_class + fp_per_class) > 0,
-    tp_per_class / (tp_per_class + fp_per_class), 0.0)
-
-recall_per_class = np.where(
-    (tp_per_class + fn_per_class) > 0,
-    tp_per_class / (tp_per_class + fn_per_class), 0.0)
-
-f1_per_class = np.where(
-    (precision_per_class + recall_per_class) > 0,
-    2 * precision_per_class * recall_per_class /
-    (precision_per_class + recall_per_class), 0.0)
-
-macro_p  = precision_per_class.mean()
-macro_r  = recall_per_class.mean()
-macro_f1 = f1_per_class.mean()
-
-# ============================================================
-# 9- Print Classification Report
-# ============================================================
-print("\n" + "="*70)
-print(f"   CLASSIFICATION REPORT  (IoU ≥ {IOU_THRESH} | conf ≥ {CONF_THRESHOLD})")
-print("="*70)
-print(f"{'Class':<20} {'Precision':>10} {'Recall':>10} "
-      f"{'F1':>10} {'TP':>8} {'FP':>8} {'FN':>8}")
-print("-"*70)
-for i, name in enumerate(class_names):
-    print(f"{name:<20} {precision_per_class[i]:>10.4f} "
-          f"{recall_per_class[i]:>10.4f} {f1_per_class[i]:>10.4f} "
-          f"{tp_per_class[i]:>8} {fp_per_class[i]:>8} {fn_per_class[i]:>8}")
-print("-"*70)
-print(f"{'macro avg':<20} {macro_p:>10.4f} {macro_r:>10.4f} {macro_f1:>10.4f} "
-      f"{tp_per_class.sum():>8} {fp_per_class.sum():>8} {fn_per_class.sum():>8}")
-print("="*70)
-
-# ============================================================
-# 10- Build Confusion Matrix
-# ============================================================
-size   = num_classes + 1
-cm     = np.zeros((size, size), dtype=int)
-labels = class_names + ["background"]
-
-for i in range(num_classes):
-    cm[i, i]           = tp_per_class[i]    # TP on diagonal
-    cm[i, num_classes] = fn_per_class[i]    # FN → missed by model
-    cm[num_classes, i] = fp_per_class[i]    # FP → false alarms
-
-with np.errstate(divide="ignore", invalid="ignore"):
-    cm_norm = np.where(
-        cm.sum(axis=1, keepdims=True) > 0,
-        cm / cm.sum(axis=1, keepdims=True), 0.0)
-
-# ============================================================
-# 11- Plot Confusion Matrix
-# ============================================================
-fig, ax = plt.subplots(figsize=(max(6, num_classes * 2 + 3),
-                                max(5, num_classes * 2 + 2)))
-
-sns.heatmap(
-    cm_norm,
-    annot=cm,
-    fmt="d",
-    cmap="Blues",
-    xticklabels=labels,
-    yticklabels=labels,
-    linewidths=0.5,
-    linecolor="lightgrey",
-    ax=ax,
-    annot_kws={"size": 13},
-    vmin=0, vmax=1,
-)
-
-ax.set_xlabel("Predicted",    fontsize=13, labelpad=10)
-ax.set_ylabel("Ground Truth", fontsize=13, labelpad=10)
-ax.set_title(
-    f"Confusion Matrix  (IoU ≥ {IOU_THRESH}  |  conf ≥ {CONF_THRESHOLD})\n"
-    f"mAP@50={coco_eval.stats[1]:.3f}  |  "
-    f"Precision={macro_p:.3f}   Recall={macro_r:.3f}   F1={macro_f1:.3f}",
-    fontsize=13, pad=14)
-ax.tick_params(axis="x", rotation=30)
-ax.tick_params(axis="y", rotation=0)
-ax.legend(handles=[
-    mpatches.Patch(color="#2196F3", label="TP (diagonal)"),
-    mpatches.Patch(color="#90CAF9", label="FN (last col)"),
-    mpatches.Patch(color="#BBDEFB", label="FP (last row)"),
-], loc="upper right", fontsize=9, framealpha=0.8)
-
-plt.tight_layout()
-plt.savefig("/content/confusion_matrix.png", dpi=150, bbox_inches="tight")
-plt.close()
-display(IPImage("/content/confusion_matrix.png"))
-print("✓ Confusion matrix displayed.")
-
-# ============================================================
-# 12- Plot Per-Class Bar Chart
-# ============================================================
-x     = np.arange(num_classes)
-width = 0.28
-
-fig2, ax2 = plt.subplots(figsize=(max(7, num_classes * 2), 5))
-
-b1 = ax2.bar(x - width, precision_per_class, width, label="Precision", color="#1976D2")
-b2 = ax2.bar(x,          recall_per_class,   width, label="Recall",    color="#388E3C")
-b3 = ax2.bar(x + width,  f1_per_class,       width, label="F1-Score",  color="#F57C00")
-
-ax2.set_xticks(x)
-ax2.set_xticklabels(class_names, rotation=25, ha="right")
-ax2.set_ylim(0, 1.15)
-ax2.set_ylabel("Score", fontsize=12)
-ax2.set_title(
-    f"Per-Class Precision / Recall / F1"
-    f"  (IoU ≥ {IOU_THRESH}  |  conf ≥ {CONF_THRESHOLD})",
-    fontsize=13)
-ax2.axhline(y=macro_f1, color="grey", linestyle="--",
-            linewidth=1.2, label=f"macro F1={macro_f1:.3f}")
-ax2.legend(fontsize=10)
-
-for bars in [b1, b2, b3]:
-    for bar in bars:
-        h = bar.get_height()
-        if h > 0.01:
-            ax2.text(bar.get_x() + bar.get_width() / 2., h + 0.02,
-                     f"{h:.2f}", ha="center", va="bottom", fontsize=10)
-
-plt.tight_layout()
-plt.savefig("/content/per_class_metrics.png", dpi=150, bbox_inches="tight")
-plt.close()
-display(IPImage("/content/per_class_metrics.png"))
-print("✓ Per-class bar chart displayed.")
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", 
+            xticklabels=["Lesion", "BG"], yticklabels=["Lesion", "BG"])
+#plt.title(f"Confusion Matrix (Conf={FINAL_CONF}, IoU={FINAL_IOU})\nF1={best_f1_entry['F1']:.3f}")
+plt.ylabel("Ground Truth")
+plt.xlabel("Predicted")
+plt.savefig("/content/best_confusion_matrix.png")
+display(IPImage("/content/best_confusion_matrix.png"))
